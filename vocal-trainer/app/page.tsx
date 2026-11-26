@@ -16,6 +16,17 @@ const MAX_RMS = 0.2;
 const GRAPH_SECONDS = 8;
 const KEEP_SECONDS = GRAPH_SECONDS + 1;
 
+// Far-jump gate: a new pitch more than half an octave (6 semitones) away from the
+// current one is only accepted if the next few frames stay near that new pitch.
+// If the signal returns to the old range or wanders elsewhere, it is ignored.
+const FAR_JUMP_SEMITONES = 6;
+const JUMP_CLUSTER_SEMITONES = 2; // far readings must stay within this of the first far reading
+const JUMP_CONFIRM_S = 0.15; // seconds a far jump must persist before it is accepted
+// Octave errors (reading lands ~12/24 semitones from the current pitch) are folded back
+// onto the current pitch instantly, and only trusted as a real octave leap after this long.
+const OCTAVE_TOLERANCE = 1.5;
+const OCTAVE_CONFIRM_S = 0.4;
+
 // B2 (MIDI 47) to D4 (MIDI 62) = 16 notes inclusive
 const DEFAULT_CENTER_MIDI = 54.5;
 const DEFAULT_NOTE_COUNT = 16;
@@ -48,6 +59,7 @@ function usePitchTracker(threshold: number) {
     offset: 0,
     hue: 0,
     stable: { midi: -1, count: 0 },
+    cand: { v: 0, t: 0, n: 0 }, // candidate for a large pitch jump (outlier gate)
   });
   useEffect(() => { thr.current = threshold; }, [threshold]);
 
@@ -83,9 +95,47 @@ function usePitchTracker(threshold: number) {
     const detector = PitchDetector.forFloat32Array(analyser.fftSize);
     const buf = new Float32Array(detector.inputLength);
     const st = s.current;
-    Object.assign(st, { count: 0, silence: 0, midi: null, g: null, rms: 0 });
+    Object.assign(st, { count: 0, silence: 0, midi: null, g: null, rms: 0, cand: { v: 0, t: 0, n: 0 } });
     history.current = [];
     setListening(true);
+
+    // Returns the pitch (MIDI) to use for this frame, or null to ignore the frame.
+    const confirmPitch = (raw: number, now: number): number | null => {
+      // No current pitch (start of a note after silence): accept anything.
+      if (st.g === null) {
+        st.cand.n = 0;
+        return raw;
+      }
+      const d = raw - st.g;
+      // Close to the current pitch: normal frame, and cancels any pending jump.
+      if (Math.abs(d) <= FAR_JUMP_SEMITONES) {
+        st.cand.n = 0;
+        return raw;
+      }
+
+      // Far from the current pitch: track how long far readings stay consistent.
+      const c = st.cand;
+      if (c.n > 0 && Math.abs(raw - c.v) <= JUMP_CLUSTER_SEMITONES) {
+        c.n++;
+      } else {
+        c.v = raw;
+        c.n = 1;
+        c.t = now;
+      }
+
+      // Is it roughly a whole number of octaves away? Then it's probably an octave error.
+      const k = Math.round(d / 12);
+      const folded = raw - 12 * k;
+      const octaveLike = k !== 0 && Math.abs(folded - st.g) <= OCTAVE_TOLERANCE;
+
+      if (now - c.t >= (octaveLike ? OCTAVE_CONFIRM_S : JUMP_CONFIRM_S)) {
+        c.n = 0; // persisted long enough: treat as a real note change
+        return raw;
+      }
+      // Not confirmed yet: octave errors are folded back to the current pitch
+      // (line stays continuous), other far jumps are ignored.
+      return octaveLike ? folded : null;
+    };
 
     const loop = () => {
       if (ctx.state === "suspended") void ctx.resume();
@@ -111,10 +161,16 @@ function usePitchTracker(threshold: number) {
         }
       } else {
         const [pitch, clarity] = detector.findPitch(buf, ctx.sampleRate);
-        if (clarity > 0.78 && pitch > 60 && pitch < 1200) {
-          st.silence = 0;
+        const rawNote = 12 * Math.log2(pitch / 440) + 69;
+        const valid = clarity > 0.78 && pitch > 60 && pitch < 1200;
+        if (valid) st.silence = 0;
 
-          const raw = 12 * Math.log2(pitch / 440) + 69;
+        // Original processing, now only run when the far-jump gate accepts the reading
+        const used = valid ? confirmPitch(rawNote, now) : null;
+        if (used !== null) {
+          const raw = used;
+          const hzUsed = 440 * Math.pow(2, (raw - 69) / 12);
+
           st.midi = st.midi === null || Math.abs(raw - st.midi) > 0.65 ? raw : lerp(st.midi, raw, 0.09);
           const midi = Math.round(st.midi);
           const cents = (st.midi - midi) * 100;
@@ -135,7 +191,7 @@ function usePitchTracker(threshold: number) {
             });
           }
 
-          if (st.count % 3 === 0) setNote({ midi, hz: Math.round(pitch * 10) / 10, cents: Math.round(cents) });
+          if (st.count % 3 === 0) setNote({ midi, hz: Math.round(hzUsed * 10) / 10, cents: Math.round(cents) });
 
           st.stable = { midi, count: st.stable.midi === midi ? st.stable.count + 1 : 1 };
           if (st.stable.count === 15) {
