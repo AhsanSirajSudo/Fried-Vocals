@@ -1,13 +1,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.routes.upload import router as upload_router
+
 app = FastAPI(
     title="FriedVocals API",
     description="Audio processing backend for FriedVocals",
     version="1.0.0"
 )
 
-# Allow our Next.js frontend to communicate with the backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -15,6 +16,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register upload routes
+app.include_router(upload_router)
 
 
 @app.get("/")
